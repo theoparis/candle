@@ -2357,6 +2357,64 @@ impl QVulkanStorage {
         Ok(out)
     }
 
+    pub fn indexed_moe_forward(
+        &self,
+        self_shape: &Shape,
+        input: &VulkanStorage,
+        input_l: &Layout,
+        ids: &VulkanStorage,
+        ids_l: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        let (experts, output_dim, input_dim) = self_shape.dims3()?;
+        let (tokens, input_slots, input_k) = input_l.shape().dims3()?;
+        let (id_tokens, selected_experts) = ids_l.shape().dims2()?;
+
+        if input.dtype != DType::F32 || ids.dtype != DType::U32 {
+            crate::bail!("Vulkan indexed MoE requires F32 input and U32 expert ids");
+        }
+        if input_k != input_dim || tokens != id_tokens {
+            crate::bail!("Vulkan indexed MoE input, weight, and routing dimensions do not match");
+        }
+        if input_slots != 1 && input_slots != selected_experts {
+            crate::bail!("Vulkan indexed MoE input slots must be 1 or match topk");
+        }
+        let (in_off, _) = input_l.contiguous_offsets().ok_or_else(|| {
+            crate::Error::Msg("Vulkan indexed MoE requires contiguous input".into())
+        })?;
+        let (ids_off, _) = ids_l.contiguous_offsets().ok_or_else(|| {
+            crate::Error::Msg("Vulkan indexed MoE requires contiguous ids".into())
+        })?;
+
+        let dev = &self.inner.device;
+        let total_routes = tokens * selected_experts;
+        let out = dev.alloc(DType::F32, total_routes * output_dim)?;
+        let output_shape = Shape::from((tokens, selected_experts, output_dim));
+
+        if total_routes == 0 || output_dim == 0 {
+            return Ok((out, output_shape));
+        }
+
+        let dequant = self.dequantize(self_shape.elem_count())?;
+
+        kernels::run_indexed_moe(
+            dev,
+            input.buf(),
+            dequant.buf(),
+            ids.buf(),
+            out.buf(),
+            tokens,
+            selected_experts,
+            input_slots,
+            input_dim,
+            output_dim,
+            experts,
+            in_off,
+            ids_off,
+        )?;
+
+        Ok((out, output_shape))
+    }
+
     pub fn grouped_q8_eligible(&self, groups: usize, n: usize, k: usize) -> bool {
         self.dtype == GgmlDType::Q8_0 && kernels::grouped_q8_eligible(self.device(), groups, n, k)
     }

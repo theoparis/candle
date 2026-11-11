@@ -146,55 +146,57 @@ impl MoeMlp {
             }
         };
 
-        let ys = if xs.device().is_metal() {
-            // Metal indexed kernels: F32 contiguous input, U32 ids, weights applied after.
+        // Try native indexed MoE on GPU backends (Metal, CUDA, Vulkan)
+        let ys_opt = if !xs.device().is_cpu() {
             let x3 = xs.reshape((n_tok, 1, hidden))?.contiguous()?;
-            let gate = gate_experts.indexed_moe_forward(&x3, &mapped_topk_ids)?;
-            let up = up_experts.indexed_moe_forward(&x3, &mapped_topk_ids)?;
-            let down_in = (up * candle_nn::ops::silu(&gate)?)?;
-            let down = down_experts.indexed_moe_forward(&down_in, &mapped_topk_ids)?;
-            down.broadcast_mul(&topk_w.unsqueeze(D::Minus1)?)?
+            let res: Result<Tensor> = (|| {
+                let gate = gate_experts.indexed_moe_forward(&x3, &mapped_topk_ids)?;
+                let up = up_experts.indexed_moe_forward(&x3, &mapped_topk_ids)?;
+                let down_in = (up * candle_nn::ops::silu(&gate)?)?;
+                let down = down_experts.indexed_moe_forward(&down_in, &mapped_topk_ids)?;
+                let weighted = down.broadcast_mul(&topk_w.unsqueeze(D::Minus1)?)?;
+                weighted.reshape((n_tok, (), hidden))?.sum(D::Minus2)
+            })();
+            res.ok()
         } else {
-            // Group the (token, slot) pairs by expert for the CPU grouped GEMM.
-            let is_prefill = n_tok > 1;
-            let (expert_ids, sorted_token_ids) =
-                mapped_topk_ids.flatten_all()?.sort_last_dim(true)?;
-            let k = self.num_experts_per_tok;
-            let gate = candle_nn::moe::moe_gemm_gguf(
-                &xs,
-                &gate_experts,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                k,
-                is_prefill,
-                DType::F32,
-            )?;
-            let up = candle_nn::moe::moe_gemm_gguf(
-                &xs,
-                &up_experts,
-                &None,
-                &sorted_token_ids,
-                &expert_ids,
-                k,
-                is_prefill,
-                DType::F32,
-            )?;
-            let down_in = (up * candle_nn::ops::silu(&gate)?)?;
-            candle_nn::moe::moe_gemm_gguf(
-                &down_in,
-                &down_experts,
-                &Some(topk_w.clone()),
-                &sorted_token_ids,
-                &expert_ids,
-                k,
-                is_prefill,
-                DType::F32,
-            )?
+            None
         };
-        ys.reshape((n_tok, (), hidden))?
-            .sum(D::Minus2)?
-            .reshape((b_sz, seq_len, hidden))
+
+        let ys = match ys_opt {
+            Some(out) => out,
+            None => {
+                // Universal fallback for CPU, Vulkan, and non-ISQ quant types:
+                // Dequantize the resident expert slots into dense tensors and batched-matmul.
+                let dev = xs.device();
+                let flat_ids = mapped_topk_ids.flatten_all()?.to_dtype(DType::U32)?;
+                let n = n_tok * self.num_experts_per_tok;
+
+                let g_all = gate_experts.dequantize(dev)?;
+                let u_all = up_experts.dequantize(dev)?;
+                let d_all = down_experts.dequantize(dev)?;
+
+                let g = g_all.index_select(&flat_ids, 0)?;
+                let u = u_all.index_select(&flat_ids, 0)?;
+                let d = d_all.index_select(&flat_ids, 0)?;
+
+                let x_rep = xs
+                    .unsqueeze(1)?
+                    .broadcast_as((n_tok, self.num_experts_per_tok, hidden))?
+                    .reshape((n, hidden, 1))?
+                    .contiguous()?;
+
+                let gate_out = g.matmul(&x_rep)?;
+                let up_out = u.matmul(&x_rep)?;
+                let h = (up_out * candle_nn::ops::silu(&gate_out)?)?;
+                let down_out = d
+                    .matmul(&h)?
+                    .reshape((n_tok, self.num_experts_per_tok, hidden))?;
+                let weighted = down_out.broadcast_mul(&topk_w.unsqueeze(D::Minus1)?)?;
+                weighted.sum(D::Minus2)?
+            }
+        };
+
+        ys.reshape((b_sz, seq_len, hidden))
     }
 }
 

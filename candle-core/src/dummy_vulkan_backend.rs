@@ -367,6 +367,16 @@ impl QVulkanStorage {
     pub fn write_bytes(&mut self, _: usize, _: &[u8]) -> Result<()> {
         Err(Error::NotCompiledWithVulkanSupport)
     }
+    pub fn indexed_moe_forward(
+        &self,
+        _: &Shape,
+        _: &VulkanStorage,
+        _: &Layout,
+        _: &VulkanStorage,
+        _: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
     pub fn fwd(&self, _: &Shape, _: &VulkanStorage, _: &Layout) -> Result<(VulkanStorage, Shape)> {
         Err(Error::NotCompiledWithVulkanSupport)
     }
