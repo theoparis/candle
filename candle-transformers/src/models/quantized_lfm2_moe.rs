@@ -55,14 +55,26 @@ impl Module for Mlp {
 }
 
 #[derive(Debug, Clone)]
+enum MoeBackend {
+    Static {
+        gate_experts: Arc<QTensor>,
+        up_experts: Arc<QTensor>,
+        down_experts: Arc<QTensor>,
+    },
+    Streaming {
+        cache: Arc<std::sync::Mutex<crate::expert_cache::LayerExpertCache>>,
+        store: Arc<crate::expert_cache::GgufExpertStore>,
+        layer_idx: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct MoeMlp {
     /// Router, `[num_experts, hidden]`, kept in F32.
     gate: Linear,
     /// Selection-only bias, `[1, num_experts]`. Absent in some exports.
     expert_bias: Option<Tensor>,
-    gate_experts: Arc<QTensor>,
-    up_experts: Arc<QTensor>,
-    down_experts: Arc<QTensor>,
+    backend: MoeBackend,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     routed_scaling_factor: f64,
@@ -97,22 +109,60 @@ impl MoeMlp {
             topk_w = (topk_w * self.routed_scaling_factor)?;
         }
 
+        let mut _cache_guard = None;
+        let (gate_experts, up_experts, down_experts, mapped_topk_ids): (
+            &QTensor,
+            &QTensor,
+            &QTensor,
+            Tensor,
+        ) = match &self.backend {
+            MoeBackend::Static {
+                gate_experts,
+                up_experts,
+                down_experts,
+            } => (
+                gate_experts.as_ref(),
+                up_experts.as_ref(),
+                down_experts.as_ref(),
+                topk_ids,
+            ),
+            MoeBackend::Streaming {
+                cache,
+                store,
+                layer_idx,
+            } => {
+                let mut guard = cache
+                    .lock()
+                    .map_err(|e| candle::Error::msg(e.to_string()))?;
+                let topk_vec = topk_ids.flatten_all()?.to_vec1::<u32>()?;
+                let wanted: Vec<usize> = topk_vec.into_iter().map(|id| id as usize).collect();
+                let local_slots = guard.ensure_resident(store, *layer_idx, &wanted)?;
+                let dev = xs.device();
+                let local_ids =
+                    Tensor::new(local_slots.as_slice(), dev)?.reshape(topk_ids.shape())?;
+                _cache_guard = Some(guard);
+                let g = _cache_guard.as_ref().unwrap();
+                (&g.gate_exps, &g.up_exps, &g.down_exps, local_ids)
+            }
+        };
+
         let ys = if xs.device().is_metal() {
             // Metal indexed kernels: F32 contiguous input, U32 ids, weights applied after.
             let x3 = xs.reshape((n_tok, 1, hidden))?.contiguous()?;
-            let gate = self.gate_experts.indexed_moe_forward(&x3, &topk_ids)?;
-            let up = self.up_experts.indexed_moe_forward(&x3, &topk_ids)?;
+            let gate = gate_experts.indexed_moe_forward(&x3, &mapped_topk_ids)?;
+            let up = up_experts.indexed_moe_forward(&x3, &mapped_topk_ids)?;
             let down_in = (up * candle_nn::ops::silu(&gate)?)?;
-            let down = self.down_experts.indexed_moe_forward(&down_in, &topk_ids)?;
+            let down = down_experts.indexed_moe_forward(&down_in, &mapped_topk_ids)?;
             down.broadcast_mul(&topk_w.unsqueeze(D::Minus1)?)?
         } else {
             // Group the (token, slot) pairs by expert for the CPU grouped GEMM.
             let is_prefill = n_tok > 1;
-            let (expert_ids, sorted_token_ids) = topk_ids.flatten_all()?.sort_last_dim(true)?;
+            let (expert_ids, sorted_token_ids) =
+                mapped_topk_ids.flatten_all()?.sort_last_dim(true)?;
             let k = self.num_experts_per_tok;
             let gate = candle_nn::moe::moe_gemm_gguf(
                 &xs,
-                &self.gate_experts,
+                &gate_experts,
                 &None,
                 &sorted_token_ids,
                 &expert_ids,
@@ -122,7 +172,7 @@ impl MoeMlp {
             )?;
             let up = candle_nn::moe::moe_gemm_gguf(
                 &xs,
-                &self.up_experts,
+                &up_experts,
                 &None,
                 &sorted_token_ids,
                 &expert_ids,
@@ -133,7 +183,7 @@ impl MoeMlp {
             let down_in = (up * candle_nn::ops::silu(&gate)?)?;
             candle_nn::moe::moe_gemm_gguf(
                 &down_in,
-                &self.down_experts,
+                &down_experts,
                 &Some(topk_w.clone()),
                 &sorted_token_ids,
                 &expert_ids,
@@ -323,7 +373,9 @@ impl ShortConvLayer {
                 .contiguous()?
         } else {
             let conv = Conv1d::new(
-                conv_weight.reshape((hidden, 1, self.l_cache))?.contiguous()?,
+                conv_weight
+                    .reshape((hidden, 1, self.l_cache))?
+                    .contiguous()?,
                 None,
                 Conv1dConfig {
                     padding: self.l_cache.saturating_sub(1),
@@ -360,6 +412,7 @@ pub struct ModelWeights {
     norm: RmsNorm,
     output: QMatMul,
     masks: HashMap<(usize, usize), Tensor>,
+    pub expert_store: Option<Arc<crate::expert_cache::GgufExpertStore>>,
 }
 
 fn value_to_usize(v: &gguf_file::Value) -> Result<usize> {
@@ -413,6 +466,16 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_gguf_with_cache_capacity(ct, reader, device, None, None)
+    }
+
+    pub fn from_gguf_with_cache_capacity<R: std::io::Seek + std::io::Read>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        gguf_path: Option<&std::path::Path>,
+        resident_expert_capacity: Option<usize>,
+    ) -> Result<Self> {
         let arch = match metadata(&ct, "general.architecture")? {
             gguf_file::Value::String(s) => s.clone(),
             _ => bail!("general.architecture is not a string"),
@@ -426,16 +489,17 @@ impl ModelWeights {
         let embedding_length = metadata(&ct, &key("embedding_length"))?.to_u32()? as usize;
         let context_length = metadata(&ct, &key("context_length"))?.to_u32()? as usize;
         let block_count = metadata(&ct, &key("block_count"))?.to_u32()? as usize;
-        let rms_norm_eps = metadata(&ct, &key("attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
+        let rms_norm_eps =
+            metadata(&ct, &key("attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
         let rope_freq_base = metadata(&ct, &key("rope.freq_base"))?.to_f32()?;
         let l_cache = metadata(&ct, &key("shortconv.l_cache"))?.to_u32()? as usize;
-        let head_count_kv = read_usize_list(
-            metadata(&ct, &key("attention.head_count_kv"))?,
-            block_count,
-        )?;
+        let head_count_kv =
+            read_usize_list(metadata(&ct, &key("attention.head_count_kv"))?, block_count)?;
 
         let num_experts = metadata(&ct, &key("expert_count"))?.to_u32()? as usize;
         let num_experts_per_tok = metadata(&ct, &key("expert_used_count"))?.to_u32()? as usize;
+        let intermediate_size =
+            metadata(&ct, &key("expert_feed_forward_length"))?.to_u32()? as usize;
         let leading_dense = ct
             .metadata
             .get(&key("leading_dense_block_count"))
@@ -462,9 +526,24 @@ impl ModelWeights {
             None => 1.0,
         };
 
+        let expert_store = match (resident_expert_capacity, gguf_path) {
+            (Some(cap), Some(path)) if cap < num_experts => {
+                let store = crate::expert_cache::GgufExpertStore::from_file(
+                    path,
+                    &ct,
+                    &arch,
+                    block_count,
+                    num_experts,
+                    intermediate_size,
+                    embedding_length,
+                )?;
+                Some(Arc::new(store))
+            }
+            _ => None,
+        };
+
         let head_dim = embedding_length / head_count;
-        let (cos, sin) =
-            precompute_freqs_cis(head_dim, rope_freq_base, context_length, device)?;
+        let (cos, sin) = precompute_freqs_cis(head_dim, rope_freq_base, context_length, device)?;
         let neg_inf = Tensor::new(f32::NEG_INFINITY, device)?;
 
         // The embedding table is tied to the output head. Keep the table in F16 to save
@@ -483,8 +562,12 @@ impl ModelWeights {
                 &ct,
                 reader,
                 device,
-                &["output_norm.weight", "embedding_norm.weight", "token_embd_norm.weight"]
-                    .map(String::from),
+                &[
+                    "output_norm.weight",
+                    "embedding_norm.weight",
+                    "token_embd_norm.weight",
+                ]
+                .map(String::from),
             )?,
             rms_norm_eps,
         )?;
@@ -504,13 +587,10 @@ impl ModelWeights {
             let prefix = format!("blk.{layer_idx}");
             let is_attention = head_count_kv[layer_idx] > 0;
 
-            let operator_norm = get_qtensor(
-                &ct,
-                reader,
-                device,
-                &[format!("{prefix}.attn_norm.weight")],
-            )?;
-            let ffn_norm = get_qtensor(&ct, reader, device, &[format!("{prefix}.ffn_norm.weight")])?;
+            let operator_norm =
+                get_qtensor(&ct, reader, device, &[format!("{prefix}.attn_norm.weight")])?;
+            let ffn_norm =
+                get_qtensor(&ct, reader, device, &[format!("{prefix}.ffn_norm.weight")])?;
 
             let ffn = if layer_idx < leading_dense {
                 FeedForward::Dense(Mlp {
@@ -532,6 +612,46 @@ impl ModelWeights {
                         device,
                         &[format!("{prefix}.ffn_up.weight")],
                     )?)?,
+                })
+            } else if let Some(store) = &expert_store {
+                let gate_w = get_dequantized(
+                    &ct,
+                    reader,
+                    device,
+                    &[format!("{prefix}.ffn_gate_inp.weight")],
+                )?
+                .to_dtype(DType::F32)?;
+                let bias_name = format!("{prefix}.exp_probs_b.bias");
+                let expert_bias = if ct.tensor_infos.contains_key(&bias_name) {
+                    Some(
+                        get_dequantized(&ct, reader, device, &[bias_name])?
+                            .to_dtype(DType::F32)?
+                            .reshape((1, num_experts))?,
+                    )
+                } else {
+                    None
+                };
+                let cap = resident_expert_capacity.unwrap().max(num_experts_per_tok);
+                let mut cache = crate::expert_cache::LayerExpertCache::new(
+                    cap,
+                    intermediate_size,
+                    embedding_length,
+                    store.dtype,
+                    device,
+                )?;
+                // Warm up first cap experts so initial prompt processing has fast hits
+                cache.warm_up(store, layer_idx, cap)?;
+                FeedForward::Moe(MoeMlp {
+                    gate: Linear::new(gate_w, None),
+                    expert_bias,
+                    backend: MoeBackend::Streaming {
+                        cache: Arc::new(std::sync::Mutex::new(cache)),
+                        store: store.clone(),
+                        layer_idx,
+                    },
+                    num_experts_per_tok,
+                    norm_topk_prob,
+                    routed_scaling_factor,
                 })
             } else {
                 let gate_w = get_dequantized(
@@ -562,9 +682,11 @@ impl ModelWeights {
                 FeedForward::Moe(MoeMlp {
                     gate: Linear::new(gate_w, None),
                     expert_bias,
-                    gate_experts: experts("ffn_gate_exps")?,
-                    up_experts: experts("ffn_up_exps")?,
-                    down_experts: experts("ffn_down_exps")?,
+                    backend: MoeBackend::Static {
+                        gate_experts: experts("ffn_gate_exps")?,
+                        up_experts: experts("ffn_up_exps")?,
+                        down_experts: experts("ffn_down_exps")?,
+                    },
                     num_experts_per_tok,
                     norm_topk_prob,
                     routed_scaling_factor,
@@ -650,6 +772,7 @@ impl ModelWeights {
             norm,
             output: QMatMul::from_qtensor(output_q)?,
             masks: HashMap::new(),
+            expert_store,
         })
     }
 

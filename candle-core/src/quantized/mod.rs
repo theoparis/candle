@@ -70,7 +70,7 @@ pub struct QTensor {
 }
 
 impl Device {
-    fn qzeros(&self, elem_count: usize, dtype: GgmlDType) -> Result<QStorage> {
+    pub fn qzeros(&self, elem_count: usize, dtype: GgmlDType) -> Result<QStorage> {
         match self {
             Device::Cpu => {
                 let storage = dtype.cpu_zeros(elem_count);
@@ -255,6 +255,33 @@ impl QStorage {
         }
     }
 
+    pub fn write_bytes(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Cpu(c) => {
+                let len = c.storage_size_in_bytes();
+                if offset + data.len() > len {
+                    crate::bail!(
+                        "write_bytes out of bounds: offset {offset} + len {} > storage len {len}",
+                        data.len()
+                    );
+                }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        c.as_mut_ptr().add(offset),
+                        data.len(),
+                    );
+                }
+                Ok(())
+            }
+            #[cfg(feature = "metal")]
+            Self::Metal(m) => m.write_bytes(offset, data),
+            #[cfg(not(feature = "metal"))]
+            Self::Metal(_) => crate::bail!("metal write_bytes without metal feature"),
+            Self::Cuda(_) => crate::bail!("cuda write_bytes not yet implemented"),
+        }
+    }
+
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
@@ -434,6 +461,7 @@ pub trait QuantizedType: Send + Sync {
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage>;
     fn storage_size_in_bytes(&self) -> usize;
     fn as_ptr(&self) -> *const u8;
+    fn as_mut_ptr(&mut self) -> *mut u8;
     fn block_size(&self) -> usize;
     #[allow(clippy::wrong_self_convention)]
     fn from_float(&mut self, xs: &[f32]);
@@ -511,6 +539,10 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     fn as_ptr(&self) -> *const u8 {
         self.as_ptr() as *const u8
     }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr() as *mut u8
+    }
 }
 
 impl std::fmt::Debug for QTensor {
@@ -534,6 +566,17 @@ fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
 }
 
 impl QTensor {
+    pub fn zeros<S: Into<Shape>>(shape: S, dtype: GgmlDType, device: &Device) -> Result<Self> {
+        let shape = shape.into();
+        let elem_count = shape.elem_count();
+        let storage = device.qzeros(elem_count, dtype)?;
+        Self::new(storage, shape)
+    }
+
+    pub fn write_bytes(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+        self.storage.write_bytes(offset, data)
+    }
+
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
         check_shape(&shape, storage.block_size())?;

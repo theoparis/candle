@@ -39,6 +39,21 @@ impl QMetalStorage {
         &self.buffer
     }
 
+    pub fn write_bytes(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+        let buf_len = self.buffer.length();
+        if offset + data.len() > buf_len {
+            crate::bail!(
+                "write_bytes out of bounds: offset {offset} + len {} > buffer len {buf_len}",
+                data.len()
+            );
+        }
+        let ptr = self.buffer.contents();
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
+        }
+        Ok(())
+    }
+
     pub fn dequantize(&self, elem_count: usize) -> Result<MetalStorage> {
         use crate::quantized::k_quants::GgmlType;
 

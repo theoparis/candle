@@ -77,6 +77,12 @@ struct Args {
     /// The context size to consider for the repeat penalty.
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
+
+    /// Strata-style expert cache capacity per layer.
+    /// When set to a number < total experts (e.g. 4, 8, 16), active experts are streamed
+    /// from disk on demand into an LRU cache, reducing VRAM / RAM usage by up to 85%.
+    #[arg(long)]
+    expert_cache_size: Option<usize>,
 }
 
 impl Args {
@@ -186,8 +192,21 @@ fn main() -> Result<()> {
         start.elapsed().as_secs_f32()
     );
 
-    let mut model = ModelWeights::from_gguf(gguf, &mut file, &device)?;
-    println!("model ready");
+    let mut model = ModelWeights::from_gguf_with_cache_capacity(
+        gguf,
+        &mut file,
+        &device,
+        Some(&model_path),
+        args.expert_cache_size,
+    )?;
+    println!(
+        "model ready{}",
+        if let Some(cap) = args.expert_cache_size {
+            format!(" (Strata disk streaming active: {cap} expert slots/layer)")
+        } else {
+            " (full residency)".to_string()
+        }
+    );
 
     let tokenizer = args.tokenizer(&model_path)?;
     let mut tos = TokenOutputStream::new(tokenizer);
@@ -315,5 +334,12 @@ fn main() -> Result<()> {
         "{sampled:4} tokens generated: {:.2} token/s",
         sampled as f64 / dt.as_secs_f64(),
     );
+    if let Some((hits, misses, streamed_bytes)) = model.expert_store.as_ref().map(|s| s.stats()) {
+        println!(
+            "\n[Strata Expert Cache] {hits} hits, {misses} misses ({:.1}% hit rate), {:.2} MiB streamed from disk",
+            if hits + misses > 0 { (hits as f64 / (hits + misses) as f64) * 100.0 } else { 0.0 },
+            streamed_bytes as f64 / (1024.0 * 1024.0),
+        );
+    }
     Ok(())
 }

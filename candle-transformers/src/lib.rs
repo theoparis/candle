@@ -1,3 +1,4 @@
+pub mod expert_cache;
 pub mod fused_moe;
 pub mod generation;
 pub mod models;
