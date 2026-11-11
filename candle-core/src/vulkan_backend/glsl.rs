@@ -2261,3 +2261,62 @@ pub fn k_binary_precise(wg: usize) -> String {
         "case 3: return float(double(a)/double(b));",
     )
 }
+
+pub fn k_indexed_moe(wg: usize) -> String {
+    let mut s = prelude(wg, 4);
+    s += &buf(0, "float", "A", true);
+    s += &buf(1, "float", "B", true);
+    s += &buf(2, "uint", "IDS", true);
+    s += &buf(3, "float", "C", false);
+    s += r#"
+layout(push_constant) uniform PC {
+    uint N;
+    uint K;
+    uint experts;
+    uint topk;
+    uint slots;
+    uint total_routes;
+    uint in_off;
+    uint ids_off;
+} pc;
+
+layout(local_size_x = WG) in;
+shared float sh[WG];
+
+void main() {
+    uint n = uint(grow());
+    uint route = gl_WorkGroupID.z;
+    uint t = gl_LocalInvocationID.x;
+
+    if (route >= pc.total_routes || n >= pc.N) return;
+
+    uint tok_idx = route / pc.topk;
+    uint slot_idx = route % pc.topk;
+
+    uint expert_id = IDS[pc.ids_off + route];
+    if (expert_id >= pc.experts) {
+        if (t == 0) C[route * pc.N + n] = 0.0;
+        return;
+    }
+
+    uint in_slot = pc.slots > 1 ? slot_idx : 0;
+    uint in_row = (tok_idx * pc.slots + in_slot) * pc.K + pc.in_off;
+    uint w_row = (expert_id * pc.N + n) * pc.K;
+
+    float acc = 0.0;
+    for (uint k = t; k < pc.K; k += uint(WG)) {
+        acc += A[in_row + k] * B[w_row + k];
+    }
+    sh[t] = acc;
+    barrier();
+
+    for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
+        if (t < s) sh[t] += sh[t + s];
+        barrier();
+    }
+
+    if (t == 0) C[route * pc.N + n] = sh[0];
+}
+"#;
+    s
+}

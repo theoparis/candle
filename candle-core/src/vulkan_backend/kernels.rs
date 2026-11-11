@@ -2735,6 +2735,46 @@ pub fn run_qembed(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn run_indexed_moe(
+    d: &VulkanDevice,
+    input: Buf,
+    weights: Buf,
+    ids: Buf,
+    out: Buf,
+    tokens: usize,
+    topk: usize,
+    slots: usize,
+    k: usize,
+    n: usize,
+    experts: usize,
+    in_off: usize,
+    ids_off: usize,
+) -> Result<()> {
+    let lim = d.limits();
+    let total_routes = tokens * topk;
+    let push = Push::default()
+        .u(n as u32)
+        .u(k as u32)
+        .u(experts as u32)
+        .u(topk as u32)
+        .u(slots as u32)
+        .u(total_routes as u32)
+        .u(in_off as u32)
+        .u(ids_off as u32);
+    let wg = 256.min(lim.wg);
+    let key = format!("indexed_moe_wg{wg}");
+    let groups = row_grid(n, total_routes, lim.max_groups_x);
+    d.launch(
+        &key,
+        move |wg| glsl::k_indexed_moe(wg),
+        &[input, weights, ids, out],
+        push,
+        &[],
+        groups,
+    )
+}
+
 /// Type alias for the pipeline cache map.
 pub type PipeMap = HashMap<String, std::sync::Arc<Pipe>>;
 

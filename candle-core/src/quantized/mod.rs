@@ -974,6 +974,24 @@ impl QTensor {
                 }
                 _ => crate::bail!("Metal indexed MoE requires Metal input and expert ids"),
             },
+            QStorage::Vulkan(s) => match (&*x.storage(), &*ids.storage()) {
+                (Storage::Vulkan(x_storage), Storage::Vulkan(ids_storage)) => {
+                    let (storage, out_shape) = s.indexed_moe_forward(
+                        self.shape(),
+                        x_storage,
+                        x.layout(),
+                        ids_storage,
+                        ids.layout(),
+                    )?;
+                    Ok(crate::tensor::from_storage(
+                        Storage::Vulkan(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                }
+                _ => crate::bail!("Vulkan indexed MoE requires Vulkan input and expert ids"),
+            },
             _ => {
                 panic!("indexed_moe_forward is not implemented in this platform!");
             }
