@@ -2377,23 +2377,41 @@ impl QVulkanStorage {
             return Ok((out, output_shape));
         }
 
-        let dequant = self.dequantize(self_shape.elem_count())?;
+        if self.dtype == GgmlDType::Q4_0 && input_dim % 32 == 0 {
+            kernels::run_indexed_moe_q4_0(
+                dev,
+                input.buf(),
+                self.inner.buf(),
+                ids.buf(),
+                out.buf(),
+                tokens,
+                selected_experts,
+                input_slots,
+                input_dim,
+                output_dim,
+                experts,
+                in_off,
+                ids_off,
+            )?;
+        } else {
+            let dequant = self.dequantize(self_shape.elem_count())?;
 
-        kernels::run_indexed_moe(
-            dev,
-            input.buf(),
-            dequant.buf(),
-            ids.buf(),
-            out.buf(),
-            tokens,
-            selected_experts,
-            input_slots,
-            input_dim,
-            output_dim,
-            experts,
-            in_off,
-            ids_off,
-        )?;
+            kernels::run_indexed_moe(
+                dev,
+                input.buf(),
+                dequant.buf(),
+                ids.buf(),
+                out.buf(),
+                tokens,
+                selected_experts,
+                input_slots,
+                input_dim,
+                output_dim,
+                experts,
+                in_off,
+                ids_off,
+            )?;
+        }
 
         Ok((out, output_shape))
     }

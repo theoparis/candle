@@ -248,6 +248,40 @@ impl crate::CustomOp1 for ArgSort {
         let dst = crate::MetalStorage::new(dst, device.clone(), el, DType::U32);
         Ok((dst, layout.shape().clone()))
     }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        storage: &crate::VulkanStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::VulkanStorage, crate::Shape)> {
+        use crate::backend::{BackendDevice, BackendStorage};
+        use crate::DType;
+        if storage.dtype() == DType::F32 && self.last_dim <= 1024 {
+            let (off, _) = layout.contiguous_offsets().ok_or_else(|| {
+                crate::Error::Msg("vulkan argsort requires contiguous input".into())
+            })?;
+            let el = layout.shape().elem_count();
+            let ncols = self.last_dim;
+            let nrows = el / ncols;
+            let dev = storage.device();
+            let dst = dev.alloc(DType::U32, el)?;
+            crate::vulkan_backend::kernels::run_arg_sort_last(
+                dev,
+                self.asc,
+                storage.buf(),
+                dst.buf(),
+                nrows,
+                ncols,
+                off,
+            )?;
+            return Ok((dst, layout.shape().clone()));
+        }
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        let out = storage.device().storage_from_cpu_storage(&out)?;
+        Ok((out, shape))
+    }
 }
 
 #[allow(unused)]

@@ -70,6 +70,14 @@ struct Args {
     #[arg(long)]
     cpu: bool,
 
+    /// Run on Vulkan device.
+    #[arg(long)]
+    vulkan: bool,
+
+    /// Vulkan device ordinal to use (defaults to preferred discrete GPU or 0).
+    #[arg(long)]
+    which_gpu: Option<usize>,
+
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
     repeat_penalty: f32,
@@ -170,7 +178,30 @@ fn main() -> Result<()> {
     let model_path = args.model_path()?;
     let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
-    let device = candle_examples::device(args.cpu)?;
+    let device = if args.cpu {
+        candle::Device::Cpu
+    } else if args.vulkan {
+        #[cfg(feature = "vulkan")]
+        {
+            let adapters = candle::vulkan_backend::enumerate_adapters().unwrap_or_default();
+            let ord = match args.which_gpu {
+                Some(i) => i,
+                None => adapters
+                    .iter()
+                    .find(|a| a.device_type == "discrete" && !a.is_software())
+                    .map(|a| a.index)
+                    .unwrap_or(0),
+            };
+            if let Some(adapter) = adapters.iter().find(|a| a.index == ord) {
+                println!("using vulkan device: {adapter}");
+            }
+            candle::Device::new_vulkan(ord)?
+        }
+        #[cfg(not(feature = "vulkan"))]
+        candle::bail!("Candle was not built with `vulkan` feature");
+    } else {
+        candle_examples::device(false)?
+    };
 
     let gguf = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path.clone()))?;
     let mut total_size_in_bytes = 0;

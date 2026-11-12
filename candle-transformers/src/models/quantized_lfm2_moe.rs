@@ -12,7 +12,7 @@ use crate::quantized_nn::RmsNorm;
 use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QMatMul, QTensor};
 use candle::{bail, DType, Device, IndexOp, Result, Tensor, D};
-use candle_nn::{Conv1d, Conv1dConfig, Embedding, Linear, Module};
+use candle_nn::{Embedding, Linear, Module};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -145,8 +145,6 @@ impl MoeMlp {
                 (&g.gate_exps, &g.up_exps, &g.down_exps, local_ids)
             }
         };
-
-        // Try native indexed MoE on GPU backends (Metal, CUDA, Vulkan)
         let ys_opt = if !xs.device().is_cpu() {
             let x3 = xs.reshape((n_tok, 1, hidden))?.contiguous()?;
             let res: Result<Tensor> = (|| {
@@ -161,7 +159,6 @@ impl MoeMlp {
         } else {
             None
         };
-
         let ys = match ys_opt {
             Some(out) => out,
             None => {
@@ -374,32 +371,27 @@ impl ShortConvLayer {
                 .sum_keepdim(2)?
                 .contiguous()?
         } else {
-            let conv = Conv1d::new(
-                conv_weight
-                    .reshape((hidden, 1, self.l_cache))?
-                    .contiguous()?,
-                None,
-                Conv1dConfig {
-                    padding: self.l_cache.saturating_sub(1),
-                    groups: hidden,
-                    ..Default::default()
-                },
-            );
-            let out = conv.forward(&bx.contiguous()?)?.narrow(2, 0, seq_len)?;
-
-            if self.l_cache > 0 {
-                let cur_len = bx.dim(2)?;
-                let start = cur_len.saturating_sub(self.l_cache);
-                let mut cache_src = bx.narrow(2, start, cur_len - start)?;
-                if cache_src.dim(2)? < self.l_cache {
-                    let pad = self.l_cache - cache_src.dim(2)?;
-                    let zeros =
-                        Tensor::zeros((b_sz, hidden, pad), cache_src.dtype(), cache_src.device())?;
-                    cache_src = Tensor::cat(&[zeros, cache_src], 2)?;
-                }
-                self.cache = Some(cache_src);
+            let pad_len = self.l_cache.saturating_sub(1);
+            let padded = if pad_len > 0 {
+                let zeros = Tensor::zeros((b_sz, hidden, pad_len), bx.dtype(), bx.device())?;
+                Tensor::cat(&[&zeros, &bx], 2)?
+            } else {
+                bx.clone()
+            };
+            let mut acc = padded
+                .narrow(2, 0, seq_len)?
+                .broadcast_mul(&conv_weight.narrow(1, 0, 1)?.unsqueeze(0)?)?;
+            for j in 1..self.l_cache {
+                let tap = padded.narrow(2, j, seq_len)?;
+                let w_j = conv_weight.narrow(1, j, 1)?.unsqueeze(0)?;
+                acc = (acc + tap.broadcast_mul(&w_j)?)?;
             }
-            out
+            if self.l_cache > 0 {
+                let cur_len = padded.dim(2)?;
+                let start = cur_len.saturating_sub(self.l_cache);
+                self.cache = Some(padded.narrow(2, start, cur_len - start)?);
+            }
+            acc
         };
 
         let conv_out = (c * &conv_out)?;
@@ -502,7 +494,7 @@ impl ModelWeights {
         let num_experts_per_tok = metadata(&ct, &key("expert_used_count"))?.to_u32()? as usize;
         let intermediate_size =
             metadata(&ct, &key("expert_feed_forward_length"))?.to_u32()? as usize;
-        let leading_dense = ct
+        let _leading_dense = ct
             .metadata
             .get(&key("leading_dense_block_count"))
             .map(|v| v.to_u32())
@@ -557,7 +549,7 @@ impl ModelWeights {
         ]
         .map(String::from);
         let tok_embd_q = get_qtensor(&ct, reader, device, &tok_embd_names)?;
-        let tok_embeddings = tok_embd_q.dequantize(device)?.to_dtype(DType::F16)?;
+        let tok_embeddings = tok_embd_q.dequantize(device)?;
 
         let norm = RmsNorm::from_qtensor(
             get_qtensor(
@@ -594,7 +586,10 @@ impl ModelWeights {
             let ffn_norm =
                 get_qtensor(&ct, reader, device, &[format!("{prefix}.ffn_norm.weight")])?;
 
-            let ffn = if layer_idx < leading_dense {
+            let is_moe = ct
+                .tensor_infos
+                .contains_key(&format!("{prefix}.ffn_gate_exps.weight"));
+            let ffn = if !is_moe {
                 FeedForward::Dense(Mlp {
                     w1: QMatMul::from_qtensor(get_qtensor(
                         &ct,

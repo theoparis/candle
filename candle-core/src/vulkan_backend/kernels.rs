@@ -1559,6 +1559,27 @@ pub fn run_arg_last(
     )
 }
 
+pub fn run_arg_sort_last(
+    d: &VulkanDevice,
+    asc: bool,
+    x: Buf,
+    out: Buf,
+    rows: usize,
+    cols: usize,
+    off: usize,
+) -> Result<()> {
+    let push = Push::default().us(rows)?.us(cols)?.us(off)?.i(asc as i32);
+    let lim = d.limits();
+    d.launch(
+        "arg_sort_last",
+        glsl::k_arg_sort_last,
+        &[x, out],
+        push,
+        &[],
+        row_grid(rows, 1, lim.max_groups_x),
+    )
+}
+
 pub fn run_reduce_generic(
     d: &VulkanDevice,
     op: i32,
@@ -2768,6 +2789,46 @@ pub fn run_indexed_moe(
     d.launch(
         &key,
         move |wg| glsl::k_indexed_moe(wg),
+        &[input, weights, ids, out],
+        push,
+        &[],
+        groups,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_indexed_moe_q4_0(
+    d: &VulkanDevice,
+    input: Buf,
+    weights: Buf,
+    ids: Buf,
+    out: Buf,
+    tokens: usize,
+    topk: usize,
+    slots: usize,
+    k: usize,
+    n: usize,
+    experts: usize,
+    in_off: usize,
+    ids_off: usize,
+) -> Result<()> {
+    let lim = d.limits();
+    let total_routes = tokens * topk;
+    let push = Push::default()
+        .u(n as u32)
+        .u(k as u32)
+        .u(experts as u32)
+        .u(topk as u32)
+        .u(slots as u32)
+        .u(total_routes as u32)
+        .u(in_off as u32)
+        .u(ids_off as u32);
+    let wg = 256.min(lim.wg);
+    let key = format!("indexed_moe_q4_0_wg{wg}");
+    let groups = row_grid(n, total_routes, lim.max_groups_x);
+    d.launch(
+        &key,
+        move |wg| glsl::k_indexed_moe_q4_0(wg),
         &[input, weights, ids, out],
         push,
         &[],
