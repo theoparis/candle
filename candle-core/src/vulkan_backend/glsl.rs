@@ -721,6 +721,64 @@ void main() {
     s
 }
 
+pub fn k_arg_sort_last(wg: usize) -> String {
+    let mut s = prelude(wg, 2);
+    s += &buf(0, "float", "x", true);
+    s += &buf(1, "uint", "o", false);
+    s += r#"
+layout(push_constant) uniform PC { int rows; int cols; int off; int asc; } pc;
+layout(local_size_x = WG) in;
+shared float shv[1024];
+shared uint shi[1024];
+
+void main() {
+    int row = grow();
+    int t = int(gl_LocalInvocationID.x);
+    if (row >= pc.rows) return;
+    int base = pc.off + row * pc.cols;
+    bool asc = pc.asc != 0;
+
+    for (int c = t; c < pc.cols; c += WG) {
+        shv[c] = x[base + c];
+        shi[c] = uint(c);
+    }
+    int n = 1;
+    while (n < pc.cols) n <<= 1;
+    for (int c = pc.cols + t; c < n; c += WG) {
+        shv[c] = asc ? INF() : NINF();
+        shi[c] = uint(c);
+    }
+    barrier();
+
+    for (int k = 2; k <= n; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = t; i < n; i += WG) {
+                int ixj = i ^ j;
+                if (ixj > i) {
+                    bool dir = ((i & k) == 0) ? asc : !asc;
+                    float vi = shv[i];
+                    float vj = shv[ixj];
+                    uint ui = shi[i];
+                    uint uj = shi[ixj];
+                    bool swap = dir ? (vi > vj || (vi == vj && ui > uj)) : (vi < vj || (vi == vj && ui > uj));
+                    if (swap) {
+                        shv[i] = vj; shv[ixj] = vi;
+                        shi[i] = uj; shi[ixj] = ui;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+
+    for (int c = t; c < pc.cols; c += WG) {
+        o[row * pc.cols + c] = shi[c];
+    }
+}
+"#;
+    s
+}
+
 // Out-of-range ids: the CPU backend returns an error, which a kernel
 // cannot.  Every indexing kernel binds the device's `fault` buffer last,
 // takes the calling thread's slot in it as its last push constant, and
@@ -2306,6 +2364,82 @@ void main() {
     float acc = 0.0;
     for (uint k = t; k < pc.K; k += uint(WG)) {
         acc += A[in_row + k] * B[w_row + k];
+    }
+    sh[t] = acc;
+    barrier();
+
+    for (uint s = uint(WG) / 2u; s > 0u; s >>= 1u) {
+        if (t < s) sh[t] += sh[t + s];
+        barrier();
+    }
+
+    if (t == 0) C[route * pc.N + n] = sh[0];
+}
+"#;
+    s
+}
+
+pub fn k_indexed_moe_q4_0(wg: usize) -> String {
+    let mut s = prelude(wg, 4);
+    s += &buf(0, "float", "A", true);
+    s += &buf(1, "uint", "B", true);
+    s += &buf(2, "uint", "IDS", true);
+    s += &buf(3, "float", "C", false);
+    s += r#"
+uint byte_at(uint b) { return (B[b >> 2u] >> ((b & 3u) * 8u)) & 0xFFu; }
+float f16_at(uint b) {
+    uint w = B[b >> 2u];
+    return ((b & 2u) == 0u) ? unpackHalf2x16(w).x : unpackHalf2x16(w).y;
+}
+
+layout(push_constant) uniform PC {
+    uint N;
+    uint K;
+    uint experts;
+    uint topk;
+    uint slots;
+    uint total_routes;
+    uint in_off;
+    uint ids_off;
+} pc;
+
+layout(local_size_x = WG) in;
+shared float sh[WG];
+
+void main() {
+    uint n = uint(grow());
+    uint route = gl_WorkGroupID.z;
+    uint t = gl_LocalInvocationID.x;
+
+    if (route >= pc.total_routes || n >= pc.N) return;
+
+    uint tok_idx = route / pc.topk;
+    uint slot_idx = route % pc.topk;
+
+    uint expert_id = IDS[pc.ids_off + route];
+    if (expert_id >= pc.experts) {
+        if (t == 0) C[route * pc.N + n] = 0.0;
+        return;
+    }
+
+    uint in_slot = pc.slots > 1 ? slot_idx : 0;
+    uint in_row = (tok_idx * pc.slots + in_slot) * pc.K + pc.in_off;
+
+    uint num_blocks = pc.K / 32u;
+    uint row_block_base = (expert_id * pc.N + n) * num_blocks;
+
+    float acc = 0.0;
+    for (uint b = t; b < num_blocks; b += uint(WG)) {
+        uint blk_byte = (row_block_base + b) * 18u;
+        float d = f16_at(blk_byte);
+        uint in_base = in_row + b * 32u;
+
+        for (uint i = 0u; i < 16u; i++) {
+            uint byte_val = byte_at(blk_byte + 2u + i);
+            float w0 = d * (float(byte_val & 0x0Fu) - 8.0);
+            float w1 = d * (float(byte_val >> 4u) - 8.0);
+            acc += A[in_base + i] * w0 + A[in_base + 16u + i] * w1;
+        }
     }
     sh[t] = acc;
     barrier();
